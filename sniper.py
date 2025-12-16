@@ -287,6 +287,8 @@ def main():
     ap.add_argument("--katana-concurrency", type=int, default=10)
     ap.add_argument("--wildcard-verify-http", action="store_true",
                     help="If set, compare wildcard HTTP fingerprint before filtering (slower, fewer false positives)")
+    ap.add_argument("--live-only", action="store_true",
+                    help="Skip archive sources and katana; keep only live HTTPX URLs to reduce output size")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -453,115 +455,119 @@ def main():
     write_lines(live_urls_path, live_urls)
     print(f"[i] live URLs for katana: {len(live_urls)}")
 
-    # 6) Archive URLs: gau + waybackurls
-    print("[*] Collecting archive URLs (gau + waybackurls)...")
-    archive_raw = os.path.join(args.out, "archive_urls_raw.txt")
-    raw_urls = []
-
-    # gau
-    gau_cmd = ["gau"]
-    # providers
-    if args.providers:
-        gau_cmd += ["-providers", args.providers]
-    # include subdomains
-    if True:
-        gau_cmd += ["-subs"]
-    # skip extensions
-    if args.skip_ext:
-        gau_cmd += ["-b", args.skip_ext]
-
-    # pass domains via stdin
-    gau_in = "\n".join(domains) + "\n"
-    out, _, _ = run_cmd(gau_cmd, input_text=gau_in, check=False)
-    raw_urls += [ln.strip() for ln in out.splitlines() if ln.strip()]
-
-    # waybackurls
-    out, _, _ = run_cmd(["waybackurls"], input_text=gau_in, check=False)
-    raw_urls += [ln.strip() for ln in out.splitlines() if ln.strip()]
-
-    # write raw
-    with open(archive_raw, "w", encoding="utf-8") as f:
-        for u in raw_urls:
-            f.write(u + "\n")
-    print(f"[i] archive URLs collected (gau+wayback): {len(raw_urls)}")
-
-    # 7) Normalize + bucket archive URLs
-    print("[*] Normalizing + bucketing archive URLs...")
-    archive_norm_path = os.path.join(args.out, "archive_urls_normalized.txt")
-    buckets_path = os.path.join(args.out, "archive_buckets.jsonl")
-
+    # Defaults for archive/katana artifacts
     norm_urls = []
-    for u in raw_urls:
-        nu = normalize_url(u)
-        if nu:
-            norm_urls.append(nu)
-    norm_urls = sorted(set(norm_urls))
-    write_lines(archive_norm_path, norm_urls)
-    print(f"[i] normalized archive URLs: {len(norm_urls)}")
+    bucket_map = {}
+    katana_rows = []
 
-    bucket_map = {}  # bucket -> {"count": int, "params": [...], "samples": [...]}
-    for nu in norm_urls:
-        bkey, params = bucket_key(nu)
-        entry = bucket_map.setdefault(bkey, {"count": 0, "params": params, "samples": []})
-        entry["count"] += 1
-        if len(entry["samples"]) < 5:
-            entry["samples"].append(nu)
-
-    with open(buckets_path, "w", encoding="utf-8") as f:
-        for bkey, v in sorted(bucket_map.items(), key=lambda kv: (-kv[1]["count"], kv[0])):
-            f.write(json.dumps({"bucket": bkey, **v}, ensure_ascii=False) + "\n")
-    print(f"[i] archive buckets: {len(bucket_map)}")
-
-    # 8) Katana crawl (use -list if available, fallback if not)
-    katana_out = os.path.join(args.out, "katana.jsonl")
-    print("[*] Crawling with katana...")
-    k_cmd = ["katana"]
-    run_katana = True
-
-    if has_flag("katana", "-list"):
-        k_cmd += ["-list", live_urls_path]
+    if args.live_only:
+        print("[i] Live-only mode: skipping archive (gau/waybackurls) and katana crawl.")
     else:
-        # Fallback: if -list not available, feed via stdin (best-effort)
-        # Many builds support -u/-target, but not always for bulk; so we do stdin piping if needed.
-        if has_flag("katana", "-u"):
-            # Some builds accept multiple -u occurrences; do minimal fallback with first N
-            for u in live_urls[:50]:
-                k_cmd += ["-u", u]
+        # 6) Archive URLs: gau + waybackurls
+        print("[*] Collecting archive URLs (gau + waybackurls)...")
+        archive_raw = os.path.join(args.out, "archive_urls_raw.txt")
+        raw_urls = []
+
+        # gau
+        gau_cmd = ["gau"]
+        # providers
+        if args.providers:
+            gau_cmd += ["-providers", args.providers]
+        # include subdomains
+        if True:
+            gau_cmd += ["-subs"]
+        # skip extensions
+        if args.skip_ext:
+            gau_cmd += ["-b", args.skip_ext]
+
+        # pass domains via stdin
+        gau_in = "\n".join(domains) + "\n"
+        out, _, _ = run_cmd(gau_cmd, input_text=gau_in, check=False)
+        raw_urls += [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+        # waybackurls
+        out, _, _ = run_cmd(["waybackurls"], input_text=gau_in, check=False)
+        raw_urls += [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+        # write raw
+        with open(archive_raw, "w", encoding="utf-8") as f:
+            for u in raw_urls:
+                f.write(u + "\n")
+        print(f"[i] archive URLs collected (gau+wayback): {len(raw_urls)}")
+
+        # 7) Normalize + bucket archive URLs
+        print("[*] Normalizing + bucketing archive URLs...")
+        archive_norm_path = os.path.join(args.out, "archive_urls_normalized.txt")
+        buckets_path = os.path.join(args.out, "archive_buckets.jsonl")
+
+        for u in raw_urls:
+            nu = normalize_url(u)
+            if nu:
+                norm_urls.append(nu)
+        norm_urls = sorted(set(norm_urls))
+        write_lines(archive_norm_path, norm_urls)
+        print(f"[i] normalized archive URLs: {len(norm_urls)}")
+
+        for nu in norm_urls:
+            bkey, params = bucket_key(nu)
+            entry = bucket_map.setdefault(bkey, {"count": 0, "params": params, "samples": []})
+            entry["count"] += 1
+            if len(entry["samples"]) < 5:
+                entry["samples"].append(nu)
+
+        with open(buckets_path, "w", encoding="utf-8") as f:
+            for bkey, v in sorted(bucket_map.items(), key=lambda kv: (-kv[1]["count"], kv[0])):
+                f.write(json.dumps({"bucket": bkey, **v}, ensure_ascii=False) + "\n")
+        print(f"[i] archive buckets: {len(bucket_map)}")
+
+        # 8) Katana crawl (use -list if available, fallback if not)
+        katana_out = os.path.join(args.out, "katana.jsonl")
+        print("[*] Crawling with katana...")
+        k_cmd = ["katana"]
+        run_katana = True
+
+        if has_flag("katana", "-list"):
+            k_cmd += ["-list", live_urls_path]
         else:
-            raise SystemExit("katana does not support -list or -u; cannot proceed.")
+            # Fallback: if -list not available, feed via stdin (best-effort)
+            # Many builds support -u/-target, but not always for bulk; so we do stdin piping if needed.
+            if has_flag("katana", "-u"):
+                # Some builds accept multiple -u occurrences; do minimal fallback with first N
+                for u in live_urls[:50]:
+                    k_cmd += ["-u", u]
+            else:
+                raise SystemExit("katana does not support -list or -u; cannot proceed.")
 
-    katana_json_flag = first_supported_flag("katana", ["-jsonl", "-json"])
-    if katana_json_flag:
-        k_cmd.append(katana_json_flag)
-    else:
-        print("[!] Katana missing JSON output flag (-jsonl/-json); skipping katana step.")
-        run_katana = False
+        katana_json_flag = first_supported_flag("katana", ["-jsonl", "-json"])
+        if katana_json_flag:
+            k_cmd.append(katana_json_flag)
+        else:
+            print("[!] Katana missing JSON output flag (-jsonl/-json); skipping katana step.")
+            run_katana = False
 
-    if run_katana and has_flag("katana", "-o"):
-        k_cmd += ["-o", katana_out]
+        if run_katana and has_flag("katana", "-o"):
+            k_cmd += ["-o", katana_out]
 
-    # optional knobs (only if supported)
-    if run_katana and has_flag("katana", "-depth"):
-        k_cmd += ["-depth", str(args.katana_depth)]
-    if run_katana and has_flag("katana", "-concurrency"):
-        k_cmd += ["-concurrency", str(args.katana_concurrency)]
-    # js crawl flag can be -jc or -js-crawl depending on build; add what exists
-    if run_katana and has_flag("katana", "-jc"):
-        k_cmd += ["-jc"]
-    elif run_katana and has_flag("katana", "-js-crawl"):
-        k_cmd += ["-js-crawl"]
+        # optional knobs (only if supported)
+        if run_katana and has_flag("katana", "-depth"):
+            k_cmd += ["-depth", str(args.katana_depth)]
+        if run_katana and has_flag("katana", "-concurrency"):
+            k_cmd += ["-concurrency", str(args.katana_concurrency)]
+        # js crawl flag can be -jc or -js-crawl depending on build; add what exists
+        if run_katana and has_flag("katana", "-jc"):
+            k_cmd += ["-jc"]
+        elif run_katana and has_flag("katana", "-js-crawl"):
+            k_cmd += ["-js-crawl"]
 
-    if run_katana and has_flag("katana", "-silent"):
-        k_cmd += ["-silent"]
+        if run_katana and has_flag("katana", "-silent"):
+            k_cmd += ["-silent"]
 
-    if run_katana:
-        print("[*] Running:", " ".join(k_cmd))
-        # If no -list, no stdin support guaranteed; but we only do stdin for gau/wayback
-        run_cmd(k_cmd, check=False)
-        katana_rows = read_jsonl(katana_out)
-    else:
-        katana_rows = []
-    print(f"[i] katana JSON rows: {len(katana_rows)}")
+        if run_katana:
+            print("[*] Running:", " ".join(k_cmd))
+            # If no -list, no stdin support guaranteed; but we only do stdin for gau/wayback
+            run_cmd(k_cmd, check=False)
+            katana_rows = read_jsonl(katana_out)
+        print(f"[i] katana JSON rows: {len(katana_rows)}")
 
     # 9) Build indexes for final merge
     dns_by_host = {}
