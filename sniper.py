@@ -14,6 +14,8 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 # -----------------------------
 # Helpers: process execution
 # -----------------------------
+TOOL_HELP_CACHE = {}
+
 def run_cmd(cmd, *, input_text=None, timeout=None, check=True):
     p = subprocess.run(
         cmd,
@@ -30,10 +32,13 @@ def run_cmd(cmd, *, input_text=None, timeout=None, check=True):
     return p.stdout, p.stderr, p.returncode
 
 def tool_help(tool):
+    if tool in TOOL_HELP_CACHE:
+        return TOOL_HELP_CACHE[tool]
     for flag in ("-h", "--help"):
         try:
             out, err, _ = run_cmd([tool, flag], check=False)
-            return (out or "") + (err or "")
+            TOOL_HELP_CACHE[tool] = (out or "") + (err or "")
+            return TOOL_HELP_CACHE[tool]
         except Exception:
             continue
     return ""
@@ -48,6 +53,15 @@ def first_supported_flag(tool, candidates):
         if has_flag(tool, f):
             return f
     return None
+
+def require_flag(tool, candidates, reason):
+    f = first_supported_flag(tool, candidates)
+    if not f:
+        raise SystemExit(
+            f"{tool} must support one of {', '.join(candidates)} for {reason}. "
+            "Please update to a recent ProjectDiscovery release."
+        )
+    return f
 
 def require_tools(tools):
     missing = [t for t in tools if shutil.which(t) is None]
@@ -179,9 +193,8 @@ def build_wildcard_map(domains, dnsx, httpx, out_dir, verify_http=True):
 
     dnsx_flags = []
     # Prefer JSONL output to stdout for parsing
-    dnsx_json_flag = first_supported_flag(dnsx, ["-json", "-j", "-jsonl"])
-    if dnsx_json_flag:
-        dnsx_flags.append(dnsx_json_flag)
+    dnsx_json_flag = require_flag(dnsx, ["-json", "-j", "-jsonl"], "JSON output parsing")
+    dnsx_flags.append(dnsx_json_flag)
     # Ask for A/AAAA where supported
     if has_flag(dnsx, "-a"):
         dnsx_flags += ["-a"]
@@ -191,9 +204,8 @@ def build_wildcard_map(domains, dnsx, httpx, out_dir, verify_http=True):
         dnsx_flags += ["-silent"]
 
     httpx_flags = []
-    httpx_json_flag = first_supported_flag(httpx, ["-json", "-j"])
-    if httpx_json_flag:
-        httpx_flags.append(httpx_json_flag)
+    httpx_json_flag = require_flag(httpx, ["-json", "-j"], "JSON output parsing")
+    httpx_flags.append(httpx_json_flag)
     # Minimal but strong probes for fingerprinting
     for f in ("-sc", "-cl", "-title", "-hash", "-silent"):
         if has_flag(httpx, f):
@@ -310,10 +322,12 @@ def main():
 
     subs = sorted(set(read_lines(sub_out)))
     write_lines(sub_out, subs)
+    print(f"[i] subfinder unique subdomains: {len(subs)}")
 
     # 2) Wildcard map (random test per root)
     print("[*] Building wildcard map (random-host test per root domain)...")
     wildcard = build_wildcard_map(domains, "dnsx", "httpx", args.out, verify_http=args.wildcard_verify_http)
+    print(f"[i] Wildcard signatures collected: {len(wildcard)} / {len(domains)} roots")
 
     # 3) DNSX enrichment
     dnsx_out = os.path.join(args.out, "dnsx.jsonl")
@@ -323,12 +337,11 @@ def main():
     else:
         raise SystemExit("dnsx does not appear to support -l/-list (unexpected).")
 
-    dnsx_json_flag = first_supported_flag("dnsx", ["-json", "-j", "-jsonl"])
+    dnsx_json_flag = require_flag("dnsx", ["-json", "-j", "-jsonl"], "JSON output parsing")
     for f in ("-a", "-aaaa", "-cname", "-ns"):
         if has_flag("dnsx", f):
             dns_cmd += [f]
-    if dnsx_json_flag:
-        dns_cmd += [dnsx_json_flag]
+    dns_cmd += [dnsx_json_flag]
     dns_cmd += ["-o", dnsx_out]
     if has_flag("dnsx", "-silent"):
         dns_cmd += ["-silent"]
@@ -337,6 +350,9 @@ def main():
     run_cmd(dns_cmd)
 
     dns_rows = read_jsonl(dnsx_out)
+    print(f"[i] dnsx JSON rows: {len(dns_rows)}")
+    if len(dns_rows) == 0:
+        print("[!] dnsx produced zero JSON rows. Check resolvers/connectivity or ensure dnsx supports the chosen JSON flag.")
 
     # 4) Wildcard filtering based on A/AAAA set (+ optional HTTP fingerprint)
     print("[*] Filtering wildcard DNS responses...")
@@ -345,9 +361,8 @@ def main():
 
     # Prepare httpx single flags for fingerprint compare
     httpx_fp_flags = []
-    httpx_fp_json = first_supported_flag("httpx", ["-json", "-j"])
-    if httpx_fp_json:
-        httpx_fp_flags.append(httpx_fp_json)
+    httpx_fp_json = require_flag("httpx", ["-json", "-j"], "HTTP fingerprint parsing")
+    httpx_fp_flags.append(httpx_fp_json)
     for f in ("-sc", "-cl", "-title", "-hash", "-silent"):
         if has_flag("httpx", f):
             if f == "-hash":
@@ -392,6 +407,7 @@ def main():
     keep_hosts = sorted(set(keep_hosts))
     keep_hosts_path = os.path.join(args.out, "hosts_filtered.txt")
     write_lines(keep_hosts_path, keep_hosts)
+    print(f"[i] wildcard filtering -> kept: {len(keep_hosts)}, filtered: {len(wildcard_hits)}")
 
     with open(os.path.join(args.out, "wildcard_filtered_hosts.txt"), "w", encoding="utf-8") as f:
         for h in sorted(wildcard_hits):
@@ -402,9 +418,8 @@ def main():
     hx_cmd = ["httpx", "-l", keep_hosts_path]
 
     # probes/enrichment (only add if supported)
-    httpx_json_flag = first_supported_flag("httpx", ["-json", "-j"])
-    if httpx_json_flag:
-        hx_cmd.append(httpx_json_flag)
+    httpx_json_flag = require_flag("httpx", ["-json", "-j"], "JSON output parsing")
+    hx_cmd.append(httpx_json_flag)
 
     want_flags = [
         "-sc", "-cl", "-title", "-td", "-server", "-ip", "-cname", "-asn", "-cdn",
@@ -423,6 +438,7 @@ def main():
     run_cmd(hx_cmd)
 
     httpx_rows = read_jsonl(httpx_out)
+    print(f"[i] httpx JSON rows: {len(httpx_rows)}")
 
     # Build live URL list for katana input
     live_urls = []
@@ -435,6 +451,7 @@ def main():
     live_urls = sorted(set(live_urls))
     live_urls_path = os.path.join(args.out, "live_urls.txt")
     write_lines(live_urls_path, live_urls)
+    print(f"[i] live URLs for katana: {len(live_urls)}")
 
     # 6) Archive URLs: gau + waybackurls
     print("[*] Collecting archive URLs (gau + waybackurls)...")
@@ -466,6 +483,7 @@ def main():
     with open(archive_raw, "w", encoding="utf-8") as f:
         for u in raw_urls:
             f.write(u + "\n")
+    print(f"[i] archive URLs collected (gau+wayback): {len(raw_urls)}")
 
     # 7) Normalize + bucket archive URLs
     print("[*] Normalizing + bucketing archive URLs...")
@@ -479,6 +497,7 @@ def main():
             norm_urls.append(nu)
     norm_urls = sorted(set(norm_urls))
     write_lines(archive_norm_path, norm_urls)
+    print(f"[i] normalized archive URLs: {len(norm_urls)}")
 
     bucket_map = {}  # bucket -> {"count": int, "params": [...], "samples": [...]}
     for nu in norm_urls:
@@ -491,11 +510,13 @@ def main():
     with open(buckets_path, "w", encoding="utf-8") as f:
         for bkey, v in sorted(bucket_map.items(), key=lambda kv: (-kv[1]["count"], kv[0])):
             f.write(json.dumps({"bucket": bkey, **v}, ensure_ascii=False) + "\n")
+    print(f"[i] archive buckets: {len(bucket_map)}")
 
     # 8) Katana crawl (use -list if available, fallback if not)
     katana_out = os.path.join(args.out, "katana.jsonl")
     print("[*] Crawling with katana...")
     k_cmd = ["katana"]
+    run_katana = True
 
     if has_flag("katana", "-list"):
         k_cmd += ["-list", live_urls_path]
@@ -509,31 +530,38 @@ def main():
         else:
             raise SystemExit("katana does not support -list or -u; cannot proceed.")
 
-    # output jsonl if supported
-    if has_flag("katana", "-jsonl"):
-        k_cmd += ["-jsonl"]
-    if has_flag("katana", "-o"):
+    katana_json_flag = first_supported_flag("katana", ["-jsonl", "-json"])
+    if katana_json_flag:
+        k_cmd.append(katana_json_flag)
+    else:
+        print("[!] Katana missing JSON output flag (-jsonl/-json); skipping katana step.")
+        run_katana = False
+
+    if run_katana and has_flag("katana", "-o"):
         k_cmd += ["-o", katana_out]
 
     # optional knobs (only if supported)
-    if has_flag("katana", "-depth"):
+    if run_katana and has_flag("katana", "-depth"):
         k_cmd += ["-depth", str(args.katana_depth)]
-    if has_flag("katana", "-concurrency"):
+    if run_katana and has_flag("katana", "-concurrency"):
         k_cmd += ["-concurrency", str(args.katana_concurrency)]
     # js crawl flag can be -jc or -js-crawl depending on build; add what exists
-    if has_flag("katana", "-jc"):
+    if run_katana and has_flag("katana", "-jc"):
         k_cmd += ["-jc"]
-    elif has_flag("katana", "-js-crawl"):
+    elif run_katana and has_flag("katana", "-js-crawl"):
         k_cmd += ["-js-crawl"]
 
-    if has_flag("katana", "-silent"):
+    if run_katana and has_flag("katana", "-silent"):
         k_cmd += ["-silent"]
 
-    print("[*] Running:", " ".join(k_cmd))
-    # If no -list, no stdin support guaranteed; but we only do stdin for gau/wayback
-    run_cmd(k_cmd, check=False)
-
-    katana_rows = read_jsonl(katana_out)
+    if run_katana:
+        print("[*] Running:", " ".join(k_cmd))
+        # If no -list, no stdin support guaranteed; but we only do stdin for gau/wayback
+        run_cmd(k_cmd, check=False)
+        katana_rows = read_jsonl(katana_out)
+    else:
+        katana_rows = []
+    print(f"[i] katana JSON rows: {len(katana_rows)}")
 
     # 9) Build indexes for final merge
     dns_by_host = {}
