@@ -40,7 +40,14 @@ def tool_help(tool):
 
 def has_flag(tool, flag):
     h = tool_help(tool)
-    return flag in h
+    # match whole flag tokens only, avoid substring hits (e.g., "-j" vs "-json")
+    return re.search(rf"(?:^|[\s,]){re.escape(flag)}(?:[\s,=]|$)", h) is not None
+
+def first_supported_flag(tool, candidates):
+    for f in candidates:
+        if has_flag(tool, f):
+            return f
+    return None
 
 def require_tools(tools):
     missing = [t for t in tools if shutil.which(t) is None]
@@ -172,8 +179,9 @@ def build_wildcard_map(domains, dnsx, httpx, out_dir, verify_http=True):
 
     dnsx_flags = []
     # Prefer JSONL output to stdout for parsing
-    if has_flag(dnsx, "-j") or has_flag(dnsx, "-json"):
-        dnsx_flags += ["-j"]
+    dnsx_json_flag = first_supported_flag(dnsx, ["-json", "-j", "-jsonl"])
+    if dnsx_json_flag:
+        dnsx_flags.append(dnsx_json_flag)
     # Ask for A/AAAA where supported
     if has_flag(dnsx, "-a"):
         dnsx_flags += ["-a"]
@@ -183,8 +191,11 @@ def build_wildcard_map(domains, dnsx, httpx, out_dir, verify_http=True):
         dnsx_flags += ["-silent"]
 
     httpx_flags = []
+    httpx_json_flag = first_supported_flag(httpx, ["-json", "-j"])
+    if httpx_json_flag:
+        httpx_flags.append(httpx_json_flag)
     # Minimal but strong probes for fingerprinting
-    for f in ("-sc", "-cl", "-title", "-hash", "-silent", "-j"):
+    for f in ("-sc", "-cl", "-title", "-hash", "-silent"):
         if has_flag(httpx, f):
             if f == "-hash":
                 # choose md5 for stability (supported per docs)
@@ -312,11 +323,12 @@ def main():
     else:
         raise SystemExit("dnsx does not appear to support -l/-list (unexpected).")
 
+    dnsx_json_flag = first_supported_flag("dnsx", ["-json", "-j", "-jsonl"])
     for f in ("-a", "-aaaa", "-cname", "-ns"):
         if has_flag("dnsx", f):
             dns_cmd += [f]
-    if has_flag("dnsx", "-j") or has_flag("dnsx", "-json"):
-        dns_cmd += ["-j"]
+    if dnsx_json_flag:
+        dns_cmd += [dnsx_json_flag]
     dns_cmd += ["-o", dnsx_out]
     if has_flag("dnsx", "-silent"):
         dns_cmd += ["-silent"]
@@ -333,7 +345,10 @@ def main():
 
     # Prepare httpx single flags for fingerprint compare
     httpx_fp_flags = []
-    for f in ("-sc", "-cl", "-title", "-hash", "-silent", "-j"):
+    httpx_fp_json = first_supported_flag("httpx", ["-json", "-j"])
+    if httpx_fp_json:
+        httpx_fp_flags.append(httpx_fp_json)
+    for f in ("-sc", "-cl", "-title", "-hash", "-silent"):
         if has_flag("httpx", f):
             if f == "-hash":
                 httpx_fp_flags += ["-hash", "md5"]
@@ -387,9 +402,13 @@ def main():
     hx_cmd = ["httpx", "-l", keep_hosts_path]
 
     # probes/enrichment (only add if supported)
+    httpx_json_flag = first_supported_flag("httpx", ["-json", "-j"])
+    if httpx_json_flag:
+        hx_cmd.append(httpx_json_flag)
+
     want_flags = [
         "-sc", "-cl", "-title", "-td", "-server", "-ip", "-cname", "-asn", "-cdn",
-        "-hash", "-silent", "-j"
+        "-hash", "-silent"
     ]
     for f in want_flags:
         if has_flag("httpx", f):
