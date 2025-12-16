@@ -8,327 +8,578 @@ import shutil
 import string
 import subprocess
 import sys
-import time
-from collections import defaultdict
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+import tempfile
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-# -------------------------
-# Utilities
-# -------------------------
-
-def which_or_die(bin_name: str) -> str:
-    p = shutil.which(bin_name)
-    if not p:
-        raise SystemExit(f"[!] Missing dependency: {bin_name} (not found in PATH)")
-    return p
-
-def run_cmd(cmd: List[str], *, stdin_bytes: Optional[bytes] = None,
-            stdout_path: Optional[Path] = None, cwd: Optional[Path] = None,
-            env: Optional[Dict[str, str]] = None, timeout: Optional[int] = None) -> Tuple[int, str, str]:
-    """
-    Runs a command. If stdout_path is provided, stdout is written to file (and also captured minimally).
-    Returns (returncode, stdout_text, stderr_text).
-    """
-    stdout_target = subprocess.PIPE
-    if stdout_path:
-        stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        f = open(stdout_path, "wb")
-        stdout_target = f
-    else:
-        f = None
-
-    try:
-        p = subprocess.run(
-            cmd,
-            input=stdin_bytes,
-            stdout=stdout_target,
-            stderr=subprocess.PIPE,
-            cwd=str(cwd) if cwd else None,
-            env=env,
-            timeout=timeout,
+# -----------------------------
+# Helpers: process execution
+# -----------------------------
+def run_cmd(cmd, *, input_text=None, timeout=None, check=True):
+    p = subprocess.run(
+        cmd,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+    )
+    if check and p.returncode != 0:
+        raise RuntimeError(
+            f"Command failed ({p.returncode}): {' '.join(cmd)}\n"
+            f"STDOUT:\n{p.stdout}\nSTDERR:\n{p.stderr}"
         )
-        out = ""
-        if stdout_path:
-            out = ""  # already written to file
-        else:
-            out = (p.stdout or b"").decode("utf-8", errors="replace")
-        err = (p.stderr or b"").decode("utf-8", errors="replace")
-        return p.returncode, out, err
-    finally:
-        if f:
-            f.close()
+    return p.stdout, p.stderr, p.returncode
 
-def help_text(tool: str) -> str:
-    # Prefer "-h" for ProjectDiscovery tools (as per docs), fallback to "--help"
-    rc, out, err = run_cmd([tool, "-h"])
-    text = out + "\n" + err
-    if rc != 0 and not text.strip():
-        rc, out, err = run_cmd([tool, "--help"])
-        text = out + "\n" + err
-    return text
+def tool_help(tool):
+    for flag in ("-h", "--help"):
+        try:
+            out, err, _ = run_cmd([tool, flag], check=False)
+            return (out or "") + (err or "")
+        except Exception:
+            continue
+    return ""
 
-def version_text(tool: str) -> str:
-    # Many PD tools support "-version" (seen in usage pages); fallback to "--version"
-    for args in (["-version"], ["--version"], ["version"]):
-        rc, out, err = run_cmd([tool] + args)
-        text = (out + "\n" + err).strip()
-        if text:
-            return text.splitlines()[0][:200]
-    return "unknown"
+def has_flag(tool, flag):
+    h = tool_help(tool)
+    return flag in h
 
-def supports_flag(tool_help: str, flag: str) -> bool:
-    # conservative: match whole token-like occurrences
-    return re.search(rf"(^|\s){re.escape(flag)}(\s|,|$)", tool_help) is not None
+def require_tools(tools):
+    missing = [t for t in tools if shutil.which(t) is None]
+    if missing:
+        raise SystemExit(f"Missing tools in PATH: {', '.join(missing)}")
 
-def read_lines(p: Path) -> List[str]:
-    if not p.exists():
-        return []
-    return [ln.strip() for ln in p.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
-
-def write_lines(p: Path, lines: Iterable[str]) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        for ln in lines:
-            f.write(ln.rstrip() + "\n")
-
-def iter_jsonl(path: Path) -> Iterable[dict]:
-    if not path.exists():
-        return
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                # keep pipeline resilient
-                continue
-
-# -------------------------
+# -----------------------------
 # URL normalization + bucketing
-# -------------------------
+# -----------------------------
+TRACKING_PARAMS_RE = re.compile(r"^(utm_|gclid$|fbclid$|yclid$|msclkid$|igshid$)", re.I)
 
-TRACKING_PREFIXES = ("utm_",)
-TRACKING_KEYS = {
-    "gclid", "fbclid", "msclkid", "yclid", "igshid",
-    "mc_cid", "mc_eid", "ref", "ref_src", "spm"
-}
-
-def normalize_url(raw: str) -> Optional[str]:
-    raw = raw.strip()
-    if not raw:
+def normalize_url(u: str) -> str | None:
+    u = (u or "").strip()
+    if not u:
         return None
 
-    # Wayback outputs often already have scheme; keep only http/https
+    # If URL has no scheme, assume http (useful for host inputs)
+    if "://" not in u:
+        u = "http://" + u
+
     try:
-        parts = urlsplit(raw)
+        sp = urlsplit(u)
     except Exception:
         return None
 
-    if parts.scheme not in ("http", "https"):
-        return None
+    scheme = (sp.scheme or "http").lower()
 
-    scheme = parts.scheme.lower()
-    netloc = parts.netloc.strip()
-
-    # Lowercase hostname portion
-    if "@" in netloc:
-        # avoid credentials in URLs for safety/consistency
-        return None
-
-    host = netloc
-    port = ""
-    if ":" in netloc:
-        host, port = netloc.rsplit(":", 1)
-
-    host = host.lower().strip(".")
+    host = (sp.hostname or "").strip().lower().rstrip(".")
     if not host:
         return None
 
-    # Drop default ports
-    if port:
-        if (scheme == "http" and port == "80") or (scheme == "https" and port == "443"):
-            port = ""
-    netloc_norm = host if not port else f"{host}:{port}"
+    port = sp.port
+    # Remove default ports
+    netloc = host
+    if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        netloc = f"{host}:{port}"
 
-    # Normalize path
-    path = parts.path or "/"
-    # collapse multiple slashes (but keep a leading slash)
+    # Basic path normalization
+    path = sp.path or "/"
     path = re.sub(r"/{2,}", "/", path)
     if not path.startswith("/"):
         path = "/" + path
+    # Optional: drop trailing slash except root
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
 
-    # Normalize query: remove tracking params, sort
-    qsl = parse_qsl(parts.query, keep_blank_values=True)
-    cleaned = []
-    for k, v in qsl:
-        kk = (k or "").strip()
-        if not kk:
+    # Normalize query: drop tracking params, sort keys
+    q = []
+    for k, v in parse_qsl(sp.query, keep_blank_values=True):
+        k = k.strip()
+        if not k:
             continue
-        kl = kk.lower()
-        if kl in TRACKING_KEYS:
+        if TRACKING_PARAMS_RE.match(k):
             continue
-        if any(kl.startswith(pfx) for pfx in TRACKING_PREFIXES):
-            continue
-        cleaned.append((kk, v))
+        q.append((k, v))
+    q.sort(key=lambda kv: (kv[0], kv[1]))
+    query = urlencode(q, doseq=True)
 
-    cleaned.sort(key=lambda kv: (kv[0].lower(), kv[1]))
+    return urlunsplit((scheme, netloc, path, query, ""))  # drop fragment
 
-    query = urlencode(cleaned, doseq=True)
+def bucket_key(u_norm: str) -> tuple[str, list[str]]:
+    sp = urlsplit(u_norm)
+    host = sp.hostname or ""
+    path = sp.path or "/"
+    params = sorted({k for k, _ in parse_qsl(sp.query, keep_blank_values=True)})
+    key = f"{host}{path}?" + ",".join(params)
+    return key, params
 
-    # Drop fragments always
-    frag = ""
-
-    return urlunsplit((scheme, netloc_norm, path, query, frag))
-
-def bucket_key(norm_url: str) -> str:
-    parts = urlsplit(norm_url)
-    host = parts.netloc.lower()
-    path = parts.path or "/"
-    qsl = parse_qsl(parts.query, keep_blank_values=True)
-    keys = sorted({k for k, _ in qsl if k})
-    ksig = ",".join(keys)
-    return f"{host}{path}?{ksig}" if ksig else f"{host}{path}"
-
-# -------------------------
-# Wildcard detection (DNS-only heuristic)
-# -------------------------
-
-def rand_label(n: int = 14) -> str:
+# -----------------------------
+# Wildcard detection
+# -----------------------------
+def rand_label(n=12):
     alphabet = string.ascii_lowercase + string.digits
     return "".join(random.choice(alphabet) for _ in range(n))
 
-@dataclass
-class WildcardSignature:
-    a: Set[str]
-    aaaa: Set[str]
-    cname: Set[str]
+def parse_dnsx_ips(obj: dict) -> set[str]:
+    ips = set()
+    for k in ("a", "aaaa", "A", "AAAA"):
+        v = obj.get(k)
+        if isinstance(v, list):
+            ips |= {str(x) for x in v if x}
+        elif isinstance(v, str) and v:
+            ips.add(v)
+    # Some versions may put ip in other keys; keep conservative.
+    return ips
 
-def extract_dns_sig(dnsx_obj: dict) -> WildcardSignature:
-    a = set()
-    aaaa = set()
-    cname = set()
+def parse_httpx_fp(obj: dict) -> tuple:
+    # A lightweight fingerprint for wildcard comparison
+    return (
+        obj.get("status_code"),
+        obj.get("content_length"),
+        (obj.get("title") or "").strip(),
+        obj.get("hash"),
+        obj.get("webserver") or obj.get("server"),
+    )
 
-    # dnsx json fields can vary; try common keys
-    for k in ("a", "A"):
-        if k in dnsx_obj and isinstance(dnsx_obj[k], list):
-            a.update([str(x).strip() for x in dnsx_obj[k] if str(x).strip()])
-        elif k in dnsx_obj and isinstance(dnsx_obj[k], str):
-            a.add(dnsx_obj[k].strip())
+def dnsx_single(dnsx, host, extra_flags):
+    # Use -u/-target if supported, else temp file with -l
+    if has_flag(dnsx, "-u") or has_flag(dnsx, "-target"):
+        cmd = [dnsx] + extra_flags + ["-u", host]
+        out, _, _ = run_cmd(cmd, check=False)
+        lines = [ln for ln in out.splitlines() if ln.strip().startswith("{")]
+        if not lines:
+            return None
+        return json.loads(lines[0])
+    else:
+        with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
+            tf.write(host + "\n")
+            tf.flush()
+            cmd = [dnsx] + extra_flags + ["-l", tf.name]
+            out, _, _ = run_cmd(cmd, check=False)
+        os.unlink(tf.name)
+        lines = [ln for ln in out.splitlines() if ln.strip().startswith("{")]
+        if not lines:
+            return None
+        return json.loads(lines[0])
 
-    for k in ("aaaa", "AAAA"):
-        if k in dnsx_obj and isinstance(dnsx_obj[k], list):
-            aaaa.update([str(x).strip() for x in dnsx_obj[k] if str(x).strip()])
-        elif k in dnsx_obj and isinstance(dnsx_obj[k], str):
-            aaaa.add(dnsx_obj[k].strip())
-
-    for k in ("cname", "CNAME"):
-        if k in dnsx_obj and isinstance(dnsx_obj[k], list):
-            cname.update([str(x).strip().lower() for x in dnsx_obj[k] if str(x).strip()])
-        elif k in dnsx_obj and isinstance(dnsx_obj[k], str):
-            cname.add(dnsx_obj[k].strip().lower())
-
-    return WildcardSignature(a=a, aaaa=aaaa, cname=cname)
-
-def dns_sig_equals(s1: WildcardSignature, s2: WildcardSignature) -> bool:
-    return s1.a == s2.a and s1.aaaa == s2.aaaa and s1.cname == s2.cname
-
-# -------------------------
-# Tool runners
-# -------------------------
-
-def run_subfinder(domain: str, outdir: Path, threads: int = 40) -> Path:
-    out_subs = outdir / "subdomains.txt"
-    cmd = ["subfinder", "-d", domain, "-silent", "-o", str(out_subs)]
-    # threads flag name in subfinder is "-t" (verify via capability detection if needed)
-    # keep optional for safety
-    h = help_text("subfinder")
-    if supports_flag(h, "-t"):
-        cmd += ["-t", str(threads)]
-    rc, _, err = run_cmd(cmd)
-    if rc != 0:
-        raise SystemExit(f"[!] subfinder failed: {err.strip()[:400]}")
-    return out_subs
-
-def run_dnsx(subdomains_file: Path, outdir: Path, resolvers: Optional[Path], threads: int = 200) -> Path:
-    out_jsonl = outdir / "dnsx.jsonl"
-    cmd = ["dnsx", "-l", str(subdomains_file), "-a", "-aaaa", "-cname", "-ns", "-json", "-o", str(out_jsonl), "-silent"]
-    if resolvers:
-        cmd += ["-r", str(resolvers)]
-    h = help_text("dnsx")
-    if supports_flag(h, "-t"):
-        cmd += ["-t", str(threads)]
-    rc, _, err = run_cmd(cmd)
-    if rc != 0:
-        raise SystemExit(f"[!] dnsx failed: {err.strip()[:400]}")
-    return out_jsonl
-
-def detect_wildcard(domain: str, outdir: Path, resolvers: Optional[Path], tests: int = 3) -> Optional[WildcardSignature]:
-    """
-    Random host tests:
-    - If >=2 tests resolve to identical (A/AAAA/CNAME) signatures, treat as wildcard signature.
-    """
-    sigs: List[WildcardSignature] = []
-    tmp = outdir / "wildcard_tests"
-    tmp.mkdir(parents=True, exist_ok=True)
-
-    for i in range(tests):
-        host = f"{rand_label()}.{domain}"
-        f_in = tmp / f"wild_{i}.txt"
-        write_lines(f_in, [host])
-
-        f_out = tmp / f"wild_{i}.jsonl"
-        cmd = ["dnsx", "-l", str(f_in), "-a", "-aaaa", "-cname", "-json", "-o", str(f_out), "-silent"]
-        if resolvers:
-            cmd += ["-r", str(resolvers)]
-        rc, _, _ = run_cmd(cmd)
-        if rc != 0:
-            continue
-
-        objs = list(iter_jsonl(f_out))
-        if not objs:
-            continue
-
-        sig = extract_dns_sig(objs[0])
-        if sig.a or sig.aaaa or sig.cname:
-            sigs.append(sig)
-
-    if len(sigs) < 2:
+def httpx_single(httpx, host, extra_flags):
+    # httpx supports -u/-target per docs
+    cmd = [httpx] + extra_flags + ["-u", host]
+    out, _, _ = run_cmd(cmd, check=False)
+    lines = [ln for ln in out.splitlines() if ln.strip().startswith("{")]
+    if not lines:
         return None
+    return json.loads(lines[0])
 
-    # find majority identical signature
-    for i in range(len(sigs)):
-        same = sum(1 for j in range(len(sigs)) if dns_sig_equals(sigs[i], sigs[j]))
-        if same >= 2:
-            return sigs[i]
+def build_wildcard_map(domains, dnsx, httpx, out_dir, verify_http=True):
+    wildcard = {}  # root -> {"test_host":..., "ips": [...], "http_fp": (...)}
 
-    return None
+    dnsx_flags = []
+    # Prefer JSONL output to stdout for parsing
+    if has_flag(dnsx, "-j") or has_flag(dnsx, "-json"):
+        dnsx_flags += ["-j"]
+    # Ask for A/AAAA where supported
+    if has_flag(dnsx, "-a"):
+        dnsx_flags += ["-a"]
+    if has_flag(dnsx, "-aaaa"):
+        dnsx_flags += ["-aaaa"]
+    if has_flag(dnsx, "-silent"):
+        dnsx_flags += ["-silent"]
 
-def filter_wildcard_hosts(dnsx_jsonl: Path, wildcard_sig: WildcardSignature, outdir: Path) -> Tuple[Path, Path]:
-    """
-    Returns (kept_hosts.txt, wildcard_hosts.txt).
-    """
-    kept = []
-    wild = []
+    httpx_flags = []
+    # Minimal but strong probes for fingerprinting
+    for f in ("-sc", "-cl", "-title", "-hash", "-silent", "-j"):
+        if has_flag(httpx, f):
+            if f == "-hash":
+                # choose md5 for stability (supported per docs)
+                httpx_flags += ["-hash", "md5"]
+            else:
+                httpx_flags += [f]
 
-    for obj in iter_jsonl(dnsx_jsonl):
-        host = obj.get("host") or obj.get("hostname") or obj.get("input")
+    for root in domains:
+        test_host = f"{rand_label()}.{root}"
+        dj = dnsx_single(dnsx, test_host, dnsx_flags)
+        if not dj:
+            continue
+        ips = parse_dnsx_ips(dj)
+        if not ips:
+            continue
+
+        entry = {"test_host": test_host, "ips": sorted(ips), "dnsx": dj}
+        if verify_http:
+            hj = httpx_single(httpx, test_host, httpx_flags)
+            if hj:
+                entry["httpx"] = hj
+                entry["http_fp"] = parse_httpx_fp(hj)
+        wildcard[root] = entry
+
+    with open(os.path.join(out_dir, "wildcards.json"), "w", encoding="utf-8") as f:
+        json.dump(wildcard, f, indent=2)
+
+    return wildcard
+
+def root_match(host, roots):
+    host = host.lower().rstrip(".")
+    best = None
+    for r in roots:
+        r = r.lower().rstrip(".")
+        if host == r or host.endswith("." + r):
+            if best is None or len(r) > len(best):
+                best = r
+    return best
+
+# -----------------------------
+# Main pipeline
+# -----------------------------
+def read_lines(p):
+    if not os.path.exists(p):
+        return []
+    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+        return [ln.strip() for ln in f if ln.strip()]
+
+def write_lines(p, items):
+    with open(p, "w", encoding="utf-8") as f:
+        for x in items:
+            f.write(x + "\n")
+
+def read_jsonl(path):
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                continue
+    return out
+
+def main():
+    ap = argparse.ArgumentParser(description="OSINT/Recon Orchestrator (subfinder+dnsx+httpx+gau+waybackurls+katana)")
+    ap.add_argument("-dL", "--domains", required=True, help="File containing root domains (one per line)")
+    ap.add_argument("-o", "--out", default="out", help="Output directory")
+    ap.add_argument("--providers", default="wayback,otx,commoncrawl", help="gau providers list")
+    ap.add_argument("--skip-ext", default="png,jpg,jpeg,gif,svg,css,woff,woff2,ttf,eot,ico,mp4,mp3,webm,pdf",
+                    help="Extensions to skip in gau (-b)")
+    ap.add_argument("--katana-depth", type=int, default=3)
+    ap.add_argument("--katana-concurrency", type=int, default=10)
+    ap.add_argument("--wildcard-verify-http", action="store_true",
+                    help="If set, compare wildcard HTTP fingerprint before filtering (slower, fewer false positives)")
+    args = ap.parse_args()
+
+    os.makedirs(args.out, exist_ok=True)
+
+    # Tools
+    tools = ["subfinder", "dnsx", "httpx", "katana", "gau", "waybackurls"]
+    require_tools(tools)
+
+    domains = read_lines(args.domains)
+    if not domains:
+        raise SystemExit("No domains found in domain list file.")
+
+    # 1) Subfinder
+    sub_out = os.path.join(args.out, "subfinder.txt")
+    sub_cmd = ["subfinder"]
+    if has_flag("subfinder", "-dL"):
+        sub_cmd += ["-dL", args.domains]
+    else:
+        # fallback: iterate domains (older/odd builds)
+        with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
+            tf.write("\n".join(domains) + "\n")
+            tf.flush()
+            sub_cmd += ["-dL", tf.name]
+        os.unlink(tf.name)
+
+    if has_flag("subfinder", "-all"):
+        sub_cmd += ["-all"]
+    if has_flag("subfinder", "-silent"):
+        sub_cmd += ["-silent"]
+    sub_cmd += ["-o", sub_out]
+    print("[*] Running:", " ".join(sub_cmd))
+    run_cmd(sub_cmd)
+
+    subs = sorted(set(read_lines(sub_out)))
+    write_lines(sub_out, subs)
+
+    # 2) Wildcard map (random test per root)
+    print("[*] Building wildcard map (random-host test per root domain)...")
+    wildcard = build_wildcard_map(domains, "dnsx", "httpx", args.out, verify_http=args.wildcard_verify_http)
+
+    # 3) DNSX enrichment
+    dnsx_out = os.path.join(args.out, "dnsx.jsonl")
+    dns_cmd = ["dnsx"]
+    if has_flag("dnsx", "-l") or has_flag("dnsx", "-list"):
+        dns_cmd += ["-l", sub_out]
+    else:
+        raise SystemExit("dnsx does not appear to support -l/-list (unexpected).")
+
+    for f in ("-a", "-aaaa", "-cname", "-ns"):
+        if has_flag("dnsx", f):
+            dns_cmd += [f]
+    if has_flag("dnsx", "-j") or has_flag("dnsx", "-json"):
+        dns_cmd += ["-j"]
+    dns_cmd += ["-o", dnsx_out]
+    if has_flag("dnsx", "-silent"):
+        dns_cmd += ["-silent"]
+
+    print("[*] Running:", " ".join(dns_cmd))
+    run_cmd(dns_cmd)
+
+    dns_rows = read_jsonl(dnsx_out)
+
+    # 4) Wildcard filtering based on A/AAAA set (+ optional HTTP fingerprint)
+    print("[*] Filtering wildcard DNS responses...")
+    keep_hosts = []
+    wildcard_hits = set()
+
+    # Prepare httpx single flags for fingerprint compare
+    httpx_fp_flags = []
+    for f in ("-sc", "-cl", "-title", "-hash", "-silent", "-j"):
+        if has_flag("httpx", f):
+            if f == "-hash":
+                httpx_fp_flags += ["-hash", "md5"]
+            else:
+                httpx_fp_flags += [f]
+
+    for row in dns_rows:
+        host = (row.get("host") or row.get("input") or "").strip().lower().rstrip(".")
         if not host:
             continue
-        sig = extract_dns_sig(obj)
-        if dns_sig_equals(sig, wildcard_sig):
-            wild.append(host)
+        root = root_match(host, domains)
+        if not root or root not in wildcard:
+            keep_hosts.append(host)
+            continue
+
+        ips = parse_dnsx_ips(row)
+        wips = set(wildcard[root].get("ips", []))
+
+        # Heuristic: if resolved IP set equals wildcard IP set (or is subset), consider wildcard-suspect
+        suspect = bool(ips) and bool(wips) and ips.issubset(wips)
+
+        if suspect and args.wildcard_verify_http and "http_fp" in wildcard[root]:
+            hj = httpx_single("httpx", host, httpx_fp_flags)
+            if hj:
+                if parse_httpx_fp(hj) == tuple(wildcard[root]["http_fp"]):
+                    wildcard_hits.add(host)
+                    continue  # filtered out
+                else:
+                    keep_hosts.append(host)
+                    continue
+            # if cannot probe, keep by default (safer)
+            keep_hosts.append(host)
+            continue
+
+        if suspect and not args.wildcard_verify_http:
+            wildcard_hits.add(host)
+            continue
+
+        keep_hosts.append(host)
+
+    keep_hosts = sorted(set(keep_hosts))
+    keep_hosts_path = os.path.join(args.out, "hosts_filtered.txt")
+    write_lines(keep_hosts_path, keep_hosts)
+
+    with open(os.path.join(args.out, "wildcard_filtered_hosts.txt"), "w", encoding="utf-8") as f:
+        for h in sorted(wildcard_hits):
+            f.write(h + "\n")
+
+    # 5) HTTPX enrichment
+    httpx_out = os.path.join(args.out, "httpx.jsonl")
+    hx_cmd = ["httpx", "-l", keep_hosts_path]
+
+    # probes/enrichment (only add if supported)
+    want_flags = [
+        "-sc", "-cl", "-title", "-td", "-server", "-ip", "-cname", "-asn", "-cdn",
+        "-hash", "-silent", "-j"
+    ]
+    for f in want_flags:
+        if has_flag("httpx", f):
+            if f == "-hash":
+                hx_cmd += ["-hash", "md5"]
+            else:
+                hx_cmd += [f]
+
+    hx_cmd += ["-o", httpx_out]
+
+    print("[*] Running:", " ".join(hx_cmd))
+    run_cmd(hx_cmd)
+
+    httpx_rows = read_jsonl(httpx_out)
+
+    # Build live URL list for katana input
+    live_urls = []
+    for r in httpx_rows:
+        u = r.get("url") or r.get("final_url") or r.get("input")
+        nu = normalize_url(u) if u else None
+        if nu:
+            live_urls.append(nu)
+
+    live_urls = sorted(set(live_urls))
+    live_urls_path = os.path.join(args.out, "live_urls.txt")
+    write_lines(live_urls_path, live_urls)
+
+    # 6) Archive URLs: gau + waybackurls
+    print("[*] Collecting archive URLs (gau + waybackurls)...")
+    archive_raw = os.path.join(args.out, "archive_urls_raw.txt")
+    raw_urls = []
+
+    # gau
+    gau_cmd = ["gau"]
+    # providers
+    if args.providers:
+        gau_cmd += ["-providers", args.providers]
+    # include subdomains
+    if True:
+        gau_cmd += ["-subs"]
+    # skip extensions
+    if args.skip_ext:
+        gau_cmd += ["-b", args.skip_ext]
+
+    # pass domains via stdin
+    gau_in = "\n".join(domains) + "\n"
+    out, _, _ = run_cmd(gau_cmd, input_text=gau_in, check=False)
+    raw_urls += [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+    # waybackurls
+    out, _, _ = run_cmd(["waybackurls"], input_text=gau_in, check=False)
+    raw_urls += [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+    # write raw
+    with open(archive_raw, "w", encoding="utf-8") as f:
+        for u in raw_urls:
+            f.write(u + "\n")
+
+    # 7) Normalize + bucket archive URLs
+    print("[*] Normalizing + bucketing archive URLs...")
+    archive_norm_path = os.path.join(args.out, "archive_urls_normalized.txt")
+    buckets_path = os.path.join(args.out, "archive_buckets.jsonl")
+
+    norm_urls = []
+    for u in raw_urls:
+        nu = normalize_url(u)
+        if nu:
+            norm_urls.append(nu)
+    norm_urls = sorted(set(norm_urls))
+    write_lines(archive_norm_path, norm_urls)
+
+    bucket_map = {}  # bucket -> {"count": int, "params": [...], "samples": [...]}
+    for nu in norm_urls:
+        bkey, params = bucket_key(nu)
+        entry = bucket_map.setdefault(bkey, {"count": 0, "params": params, "samples": []})
+        entry["count"] += 1
+        if len(entry["samples"]) < 5:
+            entry["samples"].append(nu)
+
+    with open(buckets_path, "w", encoding="utf-8") as f:
+        for bkey, v in sorted(bucket_map.items(), key=lambda kv: (-kv[1]["count"], kv[0])):
+            f.write(json.dumps({"bucket": bkey, **v}, ensure_ascii=False) + "\n")
+
+    # 8) Katana crawl (use -list if available, fallback if not)
+    katana_out = os.path.join(args.out, "katana.jsonl")
+    print("[*] Crawling with katana...")
+    k_cmd = ["katana"]
+
+    if has_flag("katana", "-list"):
+        k_cmd += ["-list", live_urls_path]
+    else:
+        # Fallback: if -list not available, feed via stdin (best-effort)
+        # Many builds support -u/-target, but not always for bulk; so we do stdin piping if needed.
+        if has_flag("katana", "-u"):
+            # Some builds accept multiple -u occurrences; do minimal fallback with first N
+            for u in live_urls[:50]:
+                k_cmd += ["-u", u]
         else:
-            kept.append(host)
+            raise SystemExit("katana does not support -list or -u; cannot proceed.")
 
-    kept_file = outdir / "hosts.filtered.txt"
-    wild_file = outdir / "hosts.wildcard.txt"
-    write_lines(kept_file, sorted(set(kept)))
-    write_lines(wild_file, sorted(set(wild)))
-    return kept_file, wild_file
+    # output jsonl if supported
+    if has_flag("katana", "-jsonl"):
+        k_cmd += ["-jsonl"]
+    if has_flag("katana", "-o"):
+        k_cmd += ["-o", katana_out]
 
-def run_httpx(hosts_file: Path):
+    # optional knobs (only if supported)
+    if has_flag("katana", "-depth"):
+        k_cmd += ["-depth", str(args.katana_depth)]
+    if has_flag("katana", "-concurrency"):
+        k_cmd += ["-concurrency", str(args.katana_concurrency)]
+    # js crawl flag can be -jc or -js-crawl depending on build; add what exists
+    if has_flag("katana", "-jc"):
+        k_cmd += ["-jc"]
+    elif has_flag("katana", "-js-crawl"):
+        k_cmd += ["-js-crawl"]
+
+    if has_flag("katana", "-silent"):
+        k_cmd += ["-silent"]
+
+    print("[*] Running:", " ".join(k_cmd))
+    # If no -list, no stdin support guaranteed; but we only do stdin for gau/wayback
+    run_cmd(k_cmd, check=False)
+
+    katana_rows = read_jsonl(katana_out)
+
+    # 9) Build indexes for final merge
+    dns_by_host = {}
+    for r in dns_rows:
+        h = (r.get("host") or r.get("input") or "").strip().lower().rstrip(".")
+        if h:
+            dns_by_host[h] = r
+
+    http_by_url = {}
+    http_by_host = {}
+    for r in httpx_rows:
+        u = r.get("url") or r.get("final_url") or r.get("input")
+        nu = normalize_url(u) if u else None
+        if nu:
+            http_by_url[nu] = r
+            h = (urlsplit(nu).hostname or "").lower().rstrip(".")
+            if h and h not in http_by_host:
+                http_by_host[h] = r
+
+    kat_by_url = {}
+    for r in katana_rows:
+        u = r.get("url") or r.get("endpoint") or r.get("input")
+        nu = normalize_url(u) if u else None
+        if not nu:
+            continue
+        kat_by_url.setdefault(nu, []).append(r)
+
+    # Universe of URLs
+    url_universe = set()
+    url_universe |= set(live_urls)
+    url_universe |= set(norm_urls)
+    url_universe |= set(kat_by_url.keys())
+
+    # 10) final.jsonl merge
+    final_path = os.path.join(args.out, "final.jsonl")
+    print(f"[*] Writing merged dataset: {final_path}")
+    with open(final_path, "w", encoding="utf-8") as f:
+        for u in sorted(url_universe):
+            sp = urlsplit(u)
+            host = (sp.hostname or "").lower().rstrip(".")
+            bkey, params = bucket_key(u)
+
+            sources = []
+            if u in http_by_url or u in live_urls:
+                sources.append("httpx")
+            if u in kat_by_url:
+                sources.append("katana")
+            if u in norm_urls:
+                sources.append("archive")
+
+            rec = {
+                "url": u,
+                "host": host,
+                "bucket": bkey,
+                "param_names": params,
+                "sources": sources,
+                "dnsx": dns_by_host.get(host),
+                "httpx": http_by_url.get(u) or http_by_host.get(host),
+                "katana": kat_by_url.get(u, []),
+                "wildcard_filtered_host": host in wildcard_hits,
+            }
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    print("[+] Done.")
+    print(f"    Outputs in: {os.path.abspath(args.out)}")
+
+if __name__ == "__main__":
+    main()
