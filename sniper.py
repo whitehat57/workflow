@@ -331,4 +331,4 @@ def filter_wildcard_hosts(dnsx_jsonl: Path, wildcard_sig: WildcardSignature, out
     write_lines(wild_file, sorted(set(wild)))
     return kept_file, wild_file
 
-def run_httpx(hosts_file: Path,
+def run_httpx(hosts_file: Path):
